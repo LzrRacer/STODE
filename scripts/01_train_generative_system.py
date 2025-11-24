@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
-# scripts/01_train_generative_system.py
-# === Strong t0 convergence version + time-affine drift & priors ===
+"""
+scripts/01_train_generative_system.py
+
+Train the Generative Spatiotemporal System (STODE).
+This script trains the VAE (optional), Potential Field, and Time-Aware ODE components.
+Features included:
+- Strong t0 convergence and anchoring.
+- Time-affine drift regularization.
+- Spatial shrinkage priors.
+- Robust time label parsing and spatial key resolution.
+"""
+
 import re
 import json
 import sys
@@ -16,9 +26,9 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from pandas.api.types import CategoricalDtype  # modern categorical check
+from pandas.api.types import CategoricalDtype
 
-# --- Setup Project Paths and PYTHONPATH (must run before local imports) ---
+# --- Setup Project Paths ---
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
@@ -36,13 +46,11 @@ from models.potential_field import SpatioTemporalPotential
 from models.time_ode import TimeAwareODE
 from data_utils import PairedTimeDataset
 from utils.training_helpers import calculate_t0_convergence_loss_smoothed
-
-# NEW: time-affine regularizers
 from losses.stode_loss import time_affine_regularizers, make_uniform_tau_grid
 
 
 # ---------------------------
-# Robust time parsing helpers
+# Robust Time Parsing Helpers
 # ---------------------------
 _num_pattern = re.compile(r"\d+(?:\.\d+)?")
 
@@ -64,13 +72,8 @@ def _time_label_sort_key(s: str):
 
 def get_ordered_time_labels_and_map(adata, time_key: str):
     """
-    Returns:
-      labels_ordered: List[str] of unique time labels in ascending biological order.
-      time_float_map: Dict[str, float] mapping label -> numeric order for spacing.
-    Priority:
-      1) If obs[time_key] is an ordered Categorical, use that order.
-      2) Else, sort by first numeric substring if present (e.g., 'D7' -> 7, 'E10.5' -> 10.5).
-      3) Else, fallback to lexicographic order and assign 0..N-1.
+    Returns ordered time labels and a mapping to numeric values.
+    Prioritizes ordered Categorical dtype, then numeric substrings, then lexicographic.
     """
     ser = adata.obs[time_key]
     if isinstance(ser.dtype, CategoricalDtype) and ser.cat.ordered:
@@ -89,30 +92,21 @@ def get_ordered_time_labels_and_map(adata, time_key: str):
 
 
 # ---------------------------
-# Spatial key resolver
+# Spatial Key Resolver
 # ---------------------------
 def resolve_spatial_key(adata, requested_key: str):
-    """
-    Return a valid spatial key from adata.obsm.
-    If requested_key is missing, try common fallbacks and print what's available.
-    """
+    """Return a valid spatial key from adata.obsm, with fallbacks."""
     obsm_keys = list(adata.obsm.keys())
     if requested_key in adata.obsm:
         return requested_key
 
-    # Common fallbacks (ordered by likelihood)
     candidates = ["spatial", "spatial_aligned", "X_spatial", "X_umap", "X_pca"]
     for cand in candidates:
         if cand in adata.obsm:
-            print(f"[resolve_spatial_key] Requested '{requested_key}' not found; using '{cand}' instead. "
-                  f"(Available obsm keys: {obsm_keys})")
+            print(f"[resolve_spatial_key] Requested '{requested_key}' not found; using '{cand}'.")
             return cand
 
-    # If nothing matched, raise a helpful error
-    raise KeyError(
-        f"Requested spatial_key '{requested_key}' not found in adata.obsm. "
-        f"Available keys: {obsm_keys}"
-    )
+    raise KeyError(f"Requested spatial_key '{requested_key}' not found. Available: {obsm_keys}")
 
 
 # ---------------------------
@@ -134,8 +128,10 @@ def euler_integrator_train_generative(
     bio_time_at_initial_state = bio_time_at_initial_state.float()
     dt_integration_tau = delta_bio_time_to_integrate / n_integration_steps if n_integration_steps > 0 else 0.0
     current_ode_state = initial_state_tensor
+    
     if n_integration_steps == 0:
         return current_ode_state
+        
     for step_idx in range(n_integration_steps):
         current_integration_tau = step_idx * dt_integration_tau
         if integrate_forward_in_biological_time:
@@ -157,16 +153,43 @@ def euler_integrator_train_generative(
         spatial_dim = ode_system_callable.spatial_dim
         s_rg = current_ode_state[:, :spatial_dim].detach().requires_grad_(True)
         z_rg = current_ode_state[:, spatial_dim:].detach().requires_grad_(True)
+        
         grad_U_s, grad_U_l = potential_model_callable.calculate_gradients(
             s_rg, z_rg, effective_bio_time_for_step_b, create_graph=True
         )
+        
         ode_in = (current_ode_state, grad_U_s, grad_U_l)
         dstate_dt = ode_system_callable(effective_bio_time_for_step_b, ode_in)
         current_ode_state = current_ode_state + dynamics_sign * dt_integration_tau * dstate_dt
+        
     return current_ode_state
 
 
-def parse_args_train_generative_system():
+@torch.no_grad()
+def estimate_t0_center(adata, time_key, spatial_key, vae_model, t0_tp_str, keep_quantile=1.0, device='cpu'):
+    uniq, _ = get_ordered_time_labels_and_map(adata, time_key)
+    if t0_tp_str is None:
+        if not uniq:
+            raise RuntimeError("No timepoints found in AnnData.")
+        t0_tp_str = uniq[0]
+        
+    ad_sub = adata[adata.obs[time_key].astype(str) == str(t0_tp_str)].copy()
+    if ad_sub.n_obs == 0:
+        raise RuntimeError(f"No cells at timepoint {t0_tp_str}")
+        
+    if 0 < keep_quantile < 1.0:
+        n_keep = max(1, int(round(keep_quantile * ad_sub.n_obs)))
+        sc.pp.subsample(ad_sub, n_obs=n_keep, random_state=123)
+        
+    X = ad_sub.X.toarray() if hasattr(ad_sub.X, "toarray") else np.asarray(ad_sub.X)
+    X_t = torch.tensor(X.astype(np.float32), device=device)
+    mu, _ = vae_model.vae.encoder(X_t)
+    z0 = mu.mean(dim=0)
+    s0 = torch.tensor(ad_sub.obsm[spatial_key], device=device, dtype=torch.float32).mean(dim=0)
+    return s0, z0
+
+
+def parse_args():
     parser = argparse.ArgumentParser(description="Train Generative Spatiotemporal System")
 
     # Core data/model args
@@ -189,16 +212,11 @@ def parse_args_train_generative_system():
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--learning_rate', type=float, default=5e-4)
     parser.add_argument('--batch_size_transition', type=int, default=32)
+    
+    # Loss Weights
     parser.add_argument('--swd_n_projections', type=int, default=64)
     parser.add_argument('--swd_spatial_weight', type=float, default=1.0)
     parser.add_argument('--swd_latent_weight', type=float, default=1.0)
-    parser.add_argument('--t0_target_source_timepoint_str', type=str, default=None)
-    parser.add_argument('--t0_target_undiff_quantile', type=float, default=1.0)
-    parser.add_argument('--target_t0_spatial_coord', type=str, default="auto")
-    parser.add_argument('--target_t0_latent_coord', type=str, default="auto")
-    parser.add_argument('--t0_time_scale', type=float, default=1.0)
-    parser.add_argument('--t0_power', type=float, default=2.0)
-    parser.add_argument('--t0_cutoff_time', type=float, default=1.0)
     parser.add_argument('--loss_weight_t0_distance', type=float, default=10.0)
     parser.add_argument('--loss_weight_t0_velocity_align', type=float, default=10.0)
     parser.add_argument('--loss_weight_vae_recon', type=float, default=1.0)
@@ -206,92 +224,68 @@ def parse_args_train_generative_system():
     parser.add_argument('--loss_weight_ode_swd', type=float, default=1.0)
     parser.add_argument('--loss_weight_time_align', type=float, default=0.1)
     parser.add_argument('--loss_weight_force_consistency', type=float, default=0.1)
+    parser.add_argument('--loss_weight_shrink', type=float, default=0.01, help="Weight for spatial radius shrinkage prior.")
+    
+    # T0 Anchoring
+    parser.add_argument('--t0_target_source_timepoint_str', type=str, default=None)
+    parser.add_argument('--t0_target_undiff_quantile', type=float, default=1.0)
+    parser.add_argument('--target_t0_spatial_coord', type=str, default="auto")
+    parser.add_argument('--target_t0_latent_coord', type=str, default="auto")
+    parser.add_argument('--t0_time_scale', type=float, default=1.0)
+    parser.add_argument('--t0_power', type=float, default=2.0)
+    parser.add_argument('--t0_cutoff_time', type=float, default=1.0)
 
-    # Existing extra args
-    parser.add_argument('--loss_weight_shrink', type=float, default=0.01, help="Weight for the spatial radius shrinkage prior.")
+    # Dynamics scaling
     parser.add_argument('--ode_latent_speed_scale', type=float, default=0.25)
     parser.add_argument('--ode_spatial_speed_scale', type=float, default=1.0)
 
+    # Environment
     parser.add_argument('--results_dir', type=str, required=True)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--device', type=str, default="")
 
     # Distribution loss mixing (SWD + Sinkhorn)
-    parser.add_argument('--use_sinkhorn', action='store_true', help='If set, mix SWD with Sinkhorn divergence.')
-    parser.add_argument('--alpha_swd', type=float, default=1.0, help='Mixture weight: Ldist = alpha*SWD + (1-alpha)*Sinkhorn.')
-    parser.add_argument('--sinkhorn_p', type=int, default=2, help='Wasserstein-p for Sinkhorn divergence.')
-    parser.add_argument('--sinkhorn_blur', type=float, default=0.05, help='GeomLoss blur parameter (epsilon ~ blur^2).')
-    parser.add_argument('--sinkhorn_scaling', type=float, default=0.8, help='GeomLoss multi-scale factor.')
-    parser.add_argument('--loss_weight_dist', type=float, default=1.0, help='Weight for the mixed distribution loss.')
+    parser.add_argument('--use_sinkhorn', action='store_true', help='Mix SWD with Sinkhorn divergence.')
+    parser.add_argument('--alpha_swd', type=float, default=1.0, help='Mixture: Ldist = alpha*SWD + (1-alpha)*Sinkhorn.')
+    parser.add_argument('--sinkhorn_p', type=int, default=2)
+    parser.add_argument('--sinkhorn_blur', type=float, default=0.05)
+    parser.add_argument('--sinkhorn_scaling', type=float, default=0.8)
+    parser.add_argument('--loss_weight_dist', type=float, default=1.0)
 
     # OT alignment loss
-    parser.add_argument('--use_ot_align', action='store_true',
-                        help='Enable OT barycentric alignment loss between phi(y_t2) and y_tilde (from entropic OT).')
-    parser.add_argument('--ot_reg_epsilon', type=float, default=0.05,
-                        help='Entropic regularization (epsilon) for POT sinkhorn.')
-    parser.add_argument('--loss_weight_ot_align', type=float, default=0.0,
-                        help='Weight for OT alignment loss (set >0 to activate when --use_ot_align is on).')
+    parser.add_argument('--use_ot_align', action='store_true', help='Enable OT barycentric alignment loss.')
+    parser.add_argument('--ot_reg_epsilon', type=float, default=0.05)
+    parser.add_argument('--loss_weight_ot_align', type=float, default=0.0)
 
-    # Extra knobs
-    parser.add_argument("--shrink_schedule", type=str, default="linear", choices=["linear", "off"])
-    parser.add_argument("--moment_matching_weight", type=float, default=0.0)
-
-    # --- NEW: time-affine scaling pathway ---
-    parser.add_argument('--use_time_affine', action='store_true',
-                        help="Enable time-dependent affine drift x' = s(t)x + b(t) on spatial dims.")
+    # Time-affine scaling
+    parser.add_argument('--use_time_affine', action='store_true', help="Enable time-dependent affine drift x' = s(t)x + b(t).")
     parser.add_argument('--affine_basis', type=str, default='fourier', choices=['fourier', 'mlp'])
     parser.add_argument('--affine_fourier_k', type=int, default=2)
     parser.add_argument('--affine_mlp_hidden', type=int, default=32)
-    # Regularization weights
-    parser.add_argument('--scale_prior_weight', type=float, default=5e-3,
-                        help="Zero-center prior on log s(t) (s ≈ 1 on average).")
-    parser.add_argument('--scale_smooth_weight', type=float, default=5e-3,
-                        help="Temporal smoothness (FD2) on log s(t).")
-    parser.add_argument('--bias_smooth_weight', type=float, default=5e-3,
-        help="Temporal smoothness (FD2) on b(t).")
+    parser.add_argument('--scale_prior_weight', type=float, default=5e-3)
+    parser.add_argument('--scale_smooth_weight', type=float, default=5e-3)
+    parser.add_argument('--bias_smooth_weight', type=float, default=5e-3)
 
     return parser.parse_args()
 
 
-@torch.no_grad()
-def estimate_t0_center(adata, time_key, spatial_key, vae_model, t0_tp_str, keep_quantile=1.0, device='cpu'):
-    uniq, _ = get_ordered_time_labels_and_map(adata, time_key)
-    if t0_tp_str is None:
-        if not uniq:
-            raise RuntimeError("No timepoints found in AnnData.")
-        t0_tp_str = uniq[0]
-    ad_sub = adata[adata.obs[time_key].astype(str) == str(t0_tp_str)].copy()
-    if ad_sub.n_obs == 0:
-        raise RuntimeError(f"No cells at timepoint {t0_tp_str}")
-    if 0 < keep_quantile < 1.0:
-        n_keep = max(1, int(round(keep_quantile * ad_sub.n_obs)))
-        sc.pp.subsample(ad_sub, n_obs=n_keep, random_state=123)
-    X = ad_sub.X.toarray() if hasattr(ad_sub.X, "toarray") else np.asarray(ad_sub.X)
-    X_t = torch.tensor(X.astype(np.float32), device=device)
-    mu, _ = vae_model.vae.encoder(X_t)
-    z0 = mu.mean(dim=0)
-    s0 = torch.tensor(ad_sub.obsm[spatial_key], device=device, dtype=torch.float32).mean(dim=0)
-    return s0, z0
-
-
 def main(args):
-    # Device & seeds
+    # Setup Device & Seeds
     device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    # Data
+    # Load Data
     adata = sc.read_h5ad(args.data_path)
     if hasattr(adata.X, "toarray"):
         adata.X = adata.X.toarray().astype(np.float32)
     else:
         adata.X = adata.X.astype(np.float32)
 
-    # --- Resolve spatial key before anything else ---
     spatial_key = resolve_spatial_key(adata, args.spatial_key)
 
-    # Models
+    # Initialize VAE
     vae = VAEWrapper(
         input_dim=adata.n_vars,
         hidden_dims=[int(d) for d in args.vae_hidden_dims.split(",")],
@@ -306,6 +300,7 @@ def main(args):
             p.requires_grad = False
         vae.eval()
 
+    # Initialize Potential
     potential = SpatioTemporalPotential(
         spatial_dim=args.spatial_dim,
         latent_dim=args.vae_latent_dim,
@@ -313,14 +308,14 @@ def main(args):
         hidden_dims=[int(d) for d in args.potential_hidden_dims.split(",")],
     ).to(device).float()
 
-    # --- NEW: ODE instantiation with optional time-affine drift ---
+    # Initialize ODE with optional Time-Affine Drift
     time_affine_cfg = None
     if args.use_time_affine:
         time_affine_cfg = dict(
             basis=args.affine_basis,
             fourier_k=args.affine_fourier_k,
             mlp_hidden=args.affine_mlp_hidden,
-            time_norm_mode="auto",  # dataset provides τ∈[0,1]
+            time_norm_mode="auto",
         )
 
     ode = TimeAwareODE(
@@ -336,7 +331,7 @@ def main(args):
 
     time_reg = LatentTimeRegressor(latent_dim=args.vae_latent_dim).to(device).float()
 
-    # Dataset & loader (robust stage handling)
+    # Dataset & Loader
     unique_times_sorted, time_float_map = get_ordered_time_labels_and_map(adata, args.time_key)
     paired_ds = PairedTimeDataset(
         adata, args.time_key, spatial_key,
@@ -344,7 +339,7 @@ def main(args):
     )
     transition_loader = DataLoader(paired_ds, batch_size=1, shuffle=True)
 
-    # t0 anchors
+    # t0 Anchors
     if args.target_t0_spatial_coord.lower() != "auto":
         s0 = torch.tensor(parse_csv_floats(args.target_t0_spatial_coord), dtype=torch.float32, device=device)
     else:
@@ -352,6 +347,7 @@ def main(args):
             adata, args.time_key, spatial_key, vae,
             args.t0_target_source_timepoint_str, args.t0_target_undiff_quantile, device,
         )
+        
     if args.target_t0_latent_coord.lower() != "auto":
         z0 = torch.tensor(parse_csv_floats(args.target_t0_latent_coord), dtype=torch.float32, device=device)
     else:
@@ -359,6 +355,7 @@ def main(args):
             adata, args.time_key, spatial_key, vae,
             args.t0_target_source_timepoint_str, args.t0_target_undiff_quantile, device,
         )
+        
     s0, z0 = s0.flatten(), z0.flatten()
     assert s0.numel() == args.spatial_dim and z0.numel() == args.vae_latent_dim
 
@@ -368,7 +365,7 @@ def main(args):
         params += list(vae.parameters())
     optimizer = optim.AdamW(params, lr=args.learning_rate)
 
-    # Output dir & t0 targets
+    # Output Directory Setup
     results_dir = Path(args.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
     (results_dir / "t0_targets.json").write_text(json.dumps({
@@ -377,19 +374,19 @@ def main(args):
         "z0": z0.detach().cpu().tolist(),
     }, indent=2))
 
-    # Shrinkage helpers
+    # Shrinkage Config
     numeric_times_all = [time_float_map[t] for t in unique_times_sorted]
     LATEST_OBSERVED_TIME = max(numeric_times_all) if numeric_times_all else 1.0
     adata_latest = adata[adata.obs[args.time_key] == unique_times_sorted[-1]]
     spatial_latest = torch.tensor(adata_latest.obsm[spatial_key], device=device).float()
     initial_radius_at_latest_time = torch.sqrt(torch.sum(spatial_latest ** 2, dim=1)).mean().item()
-    print(
-        f"Using LATEST_OBSERVED_TIME={LATEST_OBSERVED_TIME:.2f} "
-        f"and initial_radius={initial_radius_at_latest_time:.2f} for shrinkage loss."
-    )
+    
+    print(f"Using LATEST_OBSERVED_TIME={LATEST_OBSERVED_TIME:.2f} and initial_radius={initial_radius_at_latest_time:.2f}")
 
+    # --- Training Loop ---
     loss_history = []
     print(f"Starting training for {args.epochs} epochs.")
+    
     for epoch in range(args.epochs):
         epoch_losses = {k: 0.0 for k in [
             "total", "vae_recon", "vae_kl", "ode_swd", "time_align", "force_consistency",
@@ -407,16 +404,16 @@ def main(args):
             try:
                 optimizer.zero_grad()
 
-                # Unpack tensors from DataLoader
+                # Unpack Data
                 expr_t2 = batch_data["expr_k"].squeeze(0).to(device)
                 spatial_t2 = batch_data["spatial_k"].squeeze(0).to(device)
                 expr_t1_target = batch_data["expr_k_minus_1"].squeeze(0).to(device)
                 spatial_t1_target = batch_data["spatial_k_minus_1"].squeeze(0).to(device)
 
-                # Mini-batch
                 n_k, n_k_minus_1 = expr_t2.shape[0], expr_t1_target.shape[0]
                 if n_k < 1 or n_k_minus_1 < 1:
                     continue
+                    
                 batch_size = args.batch_size_transition
                 indices_k = torch.randperm(n_k)[:batch_size]
                 indices_k_minus_1 = torch.randperm(n_k_minus_1)[:batch_size]
@@ -424,46 +421,51 @@ def main(args):
                 expr_t2, spatial_t2 = expr_t2[indices_k], spatial_t2[indices_k]
                 expr_t1_target, spatial_t1_target = expr_t1_target[indices_k_minus_1], spatial_t1_target[indices_k_minus_1]
 
-                # Times
                 t2 = batch_data["time_k_numeric"].item()
                 dt_bio = batch_data["delta_t_numeric"].item()
                 t1 = t2 - dt_bio
                 n = expr_t2.size(0)
 
-                # VAE
+                # VAE Forward
                 with torch.set_grad_enabled(vae.training):
                     xhat_t2, mu_t2, logv_t2 = vae(expr_t2)
                     xhat_t1, mu_t1_target, logv_t1_target = vae(expr_t1_target)
-                loss_recon = torch.tensor(0.0, device=device); loss_kl = torch.tensor(0.0, device=device)
+                
+                loss_recon = torch.tensor(0.0, device=device)
+                loss_kl = torch.tensor(0.0, device=device)
+                
                 if vae.training:
                     loss_recon = F.mse_loss(xhat_t1, expr_t1_target) + F.mse_loss(xhat_t2, expr_t2)
                     kl_t1 = -0.5 * torch.mean(1 + logv_t1_target - mu_t1_target.pow(2) - logv_t1_target.exp())
                     kl_t2 = -0.5 * torch.mean(1 + logv_t2 - mu_t2.pow(2) - logv_t2.exp())
                     loss_kl = 0.5 * (kl_t1 + kl_t2)
 
-                # Latent-time regressor
+                # Time Regression
                 pred_t1 = time_reg(mu_t1_target.detach())
                 pred_t2 = time_reg(mu_t2.detach())
                 loss_time = F.smooth_l1_loss(pred_t1, torch.full_like(pred_t1, t1)) \
                           + F.smooth_l1_loss(pred_t2, torch.full_like(pred_t2, t2))
 
-                # ODE propagation t2 -> t1
+                # ODE Propagation (t2 -> t1)
                 init_state_t2 = torch.cat([spatial_t2, mu_t2.detach()], dim=1)
                 tgt_state_t1 = torch.cat([spatial_t1_target, mu_t1_target.detach()], dim=1)
+                
                 pred_state_t1 = euler_integrator_train_generative(
                     ode, potential, init_state_t2,
                     torch.tensor([t2], device=device), torch.tensor([dt_bio], device=device),
                     args.ode_n_integration_steps, integrate_forward_in_biological_time=False
                 )
 
-                # Distribution loss (SWD; optionally Sinkhorn)
+                # Distribution Loss (SWD / Sinkhorn)
                 scale_vec = torch.cat([
                     torch.full((args.spatial_dim,), args.swd_spatial_weight, device=device),
                     torch.full((args.vae_latent_dim,), args.swd_latent_weight, device=device),
                 ]).unsqueeze(0)
+                
                 loss_swd = sliced_wasserstein_distance(
                     pred_state_t1 * scale_vec, tgt_state_t1 * scale_vec, n_projections=args.swd_n_projections
                 )
+                
                 if args.use_sinkhorn:
                     loss_sink = sinkhorn_divergence_loss(
                         pred_state_t1 * scale_vec, tgt_state_t1 * scale_vec,
@@ -475,7 +477,7 @@ def main(args):
                     loss_sink = torch.tensor(0.0, device=device)
                     loss_dist = loss_swd
 
-                # (Optional) OT alignment anchor
+                # OT Alignment (Optional)
                 loss_ot_align = torch.tensor(0.0, device=device)
                 if args.use_ot_align:
                     with torch.no_grad():
@@ -483,19 +485,20 @@ def main(args):
                             init_state_t2.detach(), tgt_state_t1.detach(),
                             reg=args.ot_reg_epsilon, scale_vec=scale_vec
                         )
-                    loss_ot_align = torch.nn.functional.mse_loss(pred_state_t1, y_tilde)
+                    loss_ot_align = F.mse_loss(pred_state_t1, y_tilde)
 
-                # Force consistency (velocity vs -∇U)
+                # Force Consistency (Velocity vs -Grad U)
                 s_rg = pred_state_t1[:, :args.spatial_dim].detach().requires_grad_(True)
                 z_rg = pred_state_t1[:, args.spatial_dim:].detach().requires_grad_(True)
                 t1_b = torch.tensor([t1], device=device).repeat(n, 1)
                 grad_U_s, grad_U_l = potential.calculate_gradients(s_rg, z_rg, t1_b, create_graph=True)
+                
                 ode_in_at_t1 = (pred_state_t1.detach(), grad_U_s, grad_U_l)
                 vel_pred_at_t1 = ode(t1_b, ode_in_at_t1)
                 vel_target_from_U = -torch.cat([grad_U_s, grad_U_l], dim=1).detach()
                 loss_force = F.mse_loss(vel_pred_at_t1, vel_target_from_U)
 
-                # t0 convergence (distance + velocity direction)
+                # t0 Convergence (Distance + Direction)
                 loss_t0_distance = torch.tensor(0.0, device=device)
                 if t1 <= args.t0_cutoff_time:
                     loss_t0_distance = calculate_t0_convergence_loss_smoothed(
@@ -503,6 +506,7 @@ def main(args):
                         s0, z0, args.loss_weight_t0_distance, 0.5 * args.loss_weight_t0_distance,
                         args.loss_weight_t0_distance, 0.5 * args.loss_weight_t0_distance
                     )
+                    
                 with torch.no_grad():
                     unit_to_anchor = F.normalize(
                         torch.cat([s0.expand(n, -1), z0.expand(n, -1)], dim=1) - pred_state_t1, p=2, dim=1
@@ -513,19 +517,19 @@ def main(args):
                 w_t = weight_schedule_t0(t1, tau=args.t0_time_scale, power=args.t0_power)
                 loss_t0_velocity = args.loss_weight_t0_velocity_align * w_t * loss_t0_vec
 
-                # Shrinkage prior
+                # Shrinkage Prior
                 pred_spatial_t1 = pred_state_t1[:, :args.spatial_dim]
                 radius_sq = torch.sum(pred_spatial_t1 ** 2, dim=1)
                 R_target_t1 = (t1 / LATEST_OBSERVED_TIME) * initial_radius_at_latest_time
                 shrink_loss_per_cell = torch.clamp(radius_sq - R_target_t1 ** 2, min=0)
                 loss_shrink = torch.mean(shrink_loss_per_cell)
 
-                # --- NEW: time-affine regularizers (evaluated on a fixed τ grid) ---
+                # Time-Affine Regularizers
                 loss_affine = torch.tensor(0.0, device=device)
                 if args.use_time_affine and (
                     args.scale_prior_weight + args.scale_smooth_weight + args.bias_smooth_weight
                 ) > 0:
-                    tau_grid = make_uniform_tau_grid(n=9, device=device)  # T=9 points in [0,1]
+                    tau_grid = make_uniform_tau_grid(n=9, device=device)
                     prior, smooth_log_s, smooth_b = time_affine_regularizers(ode.time_affine, tau_grid)
                     loss_affine = (
                         args.scale_prior_weight * prior
@@ -533,7 +537,7 @@ def main(args):
                         + args.bias_smooth_weight * smooth_b
                     )
 
-                # Total
+                # Total Loss
                 total_loss = (
                     args.loss_weight_vae_recon * loss_recon
                     + args.loss_weight_vae_kl * loss_kl
@@ -550,7 +554,7 @@ def main(args):
                 torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
                 optimizer.step()
 
-                # Log losses
+                # Accumulate Loss Stats
                 n_batches += 1
                 for k, v in [
                     ("total", total_loss), ("vae_recon", loss_recon), ("vae_kl", loss_kl),
@@ -565,20 +569,24 @@ def main(args):
                     "Shrink": f"{loss_shrink.item():.4f}",
                     "Affine": f"{loss_affine.item():.4f}",
                 })
+
             except Exception as e:
                 print(f"[Epoch {epoch+1}] Error in training loop: {e}")
                 traceback.print_exc()
 
+        # Log Epoch Stats
         if n_batches > 0:
             for k in epoch_losses:
                 epoch_losses[k] /= n_batches
         loss_history.append({"epoch": epoch + 1, **epoch_losses})
+        
         print("Epoch {}/{} | {}".format(
             epoch + 1, args.epochs,
             ", ".join([f"{k}:{v:.4f}" for k, v in epoch_losses.items()
                        if k in ["total", "ode_swd", "t0_velocity", "shrink", "affine"]])
         ))
 
+        # Checkpoints
         if (epoch + 1) % 10 == 0 or epoch == args.epochs - 1:
             torch.save({
                 "vae_state_dict": vae.state_dict(),
@@ -590,6 +598,7 @@ def main(args):
                 "train_args_snapshot": vars(args),
             }, results_dir / f"system_model_epoch_{epoch+1}.pt")
 
+    # Final Save
     final_blob = {
         "vae_state_dict": vae.state_dict(),
         "potential_state_dict": potential.state_dict(),
@@ -603,7 +612,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    args = parse_args_train_generative_system()
+    args = parse_args()
     Path(args.results_dir).mkdir(parents=True, exist_ok=True)
     with open(Path(args.results_dir) / "config_train_gen_system.json", "w") as f:
         json.dump(vars(args), f, indent=2)
