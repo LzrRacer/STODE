@@ -10,20 +10,20 @@ class TimeAwareODE(nn.Module):
         spatial_dim,
         latent_dim,
         time_embedding_dim,
-        grad_potential_dim,  # This is spatial_dim + latent_dim
+        grad_potential_dim,  
         hidden_dims,
         damping_coeff: float = 0.0,
         spatial_speed_scale: float = 1.0,
         latent_speed_scale: float = 0.25,
-        time_affine_cfg: Optional[dict] = None,  # NEW
+        time_affine_cfg: Optional[dict] = None,  
     ):
         super().__init__()
         self.spatial_dim = spatial_dim
         self.latent_dim = latent_dim
         self.time_embedding_dim = time_embedding_dim
-        self.damping_coeff = damping_coeff  # Could be learned or fixed
-        self.spatial_speed_scale = float(spatial_speed_scale)  # NEW
-        self.latent_speed_scale = float(latent_speed_scale)    # NEW
+        self.damping_coeff = damping_coeff  
+        self.spatial_speed_scale = float(spatial_speed_scale)  
+        self.latent_speed_scale = float(latent_speed_scale)    
 
         # Optional time-dependent affine drift (s(t)*x + b(t)) in spatial dims
         self.time_affine = (
@@ -51,7 +51,6 @@ class TimeAwareODE(nn.Module):
             layers.append(nn.Tanh())
             current_dim = h_dim
 
-        # Output: d(spatial)/dt_bio, d(latent_z)/dt_bio (these are velocities)
         self.output_net = nn.Linear(current_dim, spatial_dim + latent_dim)
         self.mlp = nn.Sequential(*layers)
 
@@ -98,7 +97,7 @@ class TimeAwareODE(nn.Module):
         d_spatial_dt = state_derivatives[:, :self.spatial_dim] * self.spatial_speed_scale
         d_latent_dt = state_derivatives[:, self.spatial_dim:] * self.latent_speed_scale
 
-        # NEW: add time-dependent affine drift on spatial coordinates: x' += s(t)*x + b(t)
+
         if self.time_affine is not None:
             tB = biological_time_t_batch  # [B,1]
             s_t, b_t = self.time_affine(tB)  # s_t: [B,1], b_t: [B, S]
@@ -108,7 +107,43 @@ class TimeAwareODE(nn.Module):
         return torch.cat([d_spatial_dt, d_latent_dt], dim=1)
 
 
-# ---------- NEW: lightweight time-affine parameterization ----------
+import torch
+import torch.nn as nn
+
+class GradientFlowODE(nn.Module):
+    """
+    Implements the dynamics described in the paper: dy/dt = -∇U(y, t).
+    
+    Unlike previous versions that approximated the velocity field with a neural network,
+    this module strictly enforces the gradient flow dynamics derived from the potential field.
+    """
+    def __init__(self, spatial_dim, latent_dim):
+        super().__init__()
+        self.spatial_dim = spatial_dim
+        self.latent_dim = latent_dim
+
+    def forward(self, t, state_and_grads):
+        """
+        Returns the time derivative of the state y = [s, z].
+        
+        Args:
+            t: Current time (scalar or tensor).
+            state_and_grads: Tuple containing:
+                - current_state: The state vector y.
+                - grad_U_spatial: ∇_s U (Gradient w.r.t spatial coords).
+                - grad_U_latent:  ∇_z U (Gradient w.r.t latent vars).
+                
+        Returns:
+            dy/dt: The velocity vector [-∇_s U, -∇_z U].
+        """
+        _, grad_U_spatial, grad_U_latent = state_and_grads
+        
+        d_spatial_dt = -grad_U_spatial
+        d_latent_dt = -grad_U_latent
+        
+        return torch.cat([d_spatial_dt, d_latent_dt], dim=1)
+
+
 class TimeAffine1D(nn.Module):
     """
     s(t), b(t) for spatial dims.
