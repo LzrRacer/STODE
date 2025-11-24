@@ -10,8 +10,6 @@ STODE is a deep generative framework that integrates a VAE with a potential-guid
   <img src="Fig1.jpg" alt="STODE overview figure" width="800">
 </p>
 
-[⬇️ Download this overview figure](Fig1.jpg)
-
 ---
 
 ## Quick start
