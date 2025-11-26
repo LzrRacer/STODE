@@ -47,3 +47,4 @@ If you use this code, please cite:
 
 > Majima K., Kojima Y., Shimamura T.  
 > **STODE: A Deep Generative Framework for Continuous Spatiotemporal Dynamics in Spatial Transcriptomics**, 2025.
+> https://www.biorxiv.org/cgi/content/short/2025.11.24.690134v1
